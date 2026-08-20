@@ -1,0 +1,246 @@
+---
+title: "Mill River PFAS: SSN object development"
+author: "Raul Vera and Matthew Fuller"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+    toc_depth: 4
+  html_document:
+    toc: yes
+    toc_depth: '4'
+    df_print: paged
+    code_folding: hide 
+---
+
+
+__________
+
+This document describes the process and code used to explore PFAS concentrations in the Mill River watershed near Amherst, MA using spatial stream network (SSN) models.  
+
+Specifically, we build the SSN object in this script and it takes less than 5 minutes to run all the code.  
+
+
+#  1.  Set Up Analysis  
+
+```{r setup, message=FALSE, warning=FALSE}
+library(viridis)
+library(stringr)
+library(knitr)
+library(pander)
+library(tidyverse)
+library(sf)
+library(SSNbler)
+library(SSN2)
+panderOptions('digits',8)
+
+# set tidy r code not to run more than 100 characters wide
+opts_chunk$set(tidy.opts=list(width.cutoff=100),tidy=FALSE) 
+
+# hide all warning messages in document
+knitr::opts_chunk$set(message = FALSE)
+```
+
+#  2.  Read in data  
+
+## Network data  
+
+```{r}
+covariate_data <- readRDS("../data/summary_basin_covariates.rds") |>
+  left_join(readRDS("../data/summary_rca_covariates.rds"), by = "reach_id")
+
+flines  <- st_read(dsn = "../data/shp/MillRiver_NHDPlusHR_EPSG5070_trace.shp") |>
+  left_join(covariate_data, by = "reach_id")
+
+flowline <- st_transform(flines, crs =5070) |> st_zm() 
+```
+
+
+##  Observation sites  
+
+```{r}
+#bringing in the results from my PFAS analysis
+PFAS_Spatial_March_2026 <- 
+  read_csv("https://raw.githubusercontent.com/rvera177/MillRiver_PFAS/refs/heads/main/data/Spatial_3_PFASresults.csv")
+
+#giving a simpler name
+S3 <- PFAS_Spatial_March_2026 
+
+S3 <- S3 %>% #removing NA's in lat and long. Shouldn't be any
+  filter(!is.na(Latitude), !is.na(Longitude))
+
+#this changes the name of some of the headers for easier manipulation later
+clean_names <- function(x) {
+  x |>
+    gsub(" ", "_", x = _) |>
+    gsub("[-:]", ".", x = _) |>
+    make.names() |>
+    gsub("^X(\\d)", "\\1", x = _)
+}
+
+colnames(S3) <- clean_names(colnames(S3))
+names(S3)
+#Naming functional head groups that I can add together later
+pfas_groups <- list(
+  PFCA = c("PFBA", "PFPeA", "PFHxA", "PFHpA", "PFOA",
+           "PFNA", "PFDA", "PFUnA", "PFDoA", "PFTrDA", "PFTeDA"),
+  PFSA = c("PFBS", "PFPeS", "PFHxS", "PFHpS", "PFOS",
+           "PFNS", "PFDS", "PFDoS"),
+  FTSA = c("4.2FTS", "6.2FTS", "8.2FTS"),
+  PFOSA = c("PFOSA", "NMeFOSA", "NEtFOSA"),
+  FOSAA = c("NMeFOSAA", "NEtFOSAA"),
+  PFECA = c("HFPO.DA", "ADONA", "PFMPA", "PFMBA", "NFDHA"),
+  PFESA = c("9Cl.PF3ONS", "11Cl.PF3OUdS", "PFEESA"),
+  FTCA = c("3.3_FTCA", "5.3_FTCA", "7.3_FTCA"))
+
+#create new columns in S3 with the sum of corresponding species in the family
+S3 <- S3 %>%
+  bind_cols(
+    lapply(names(pfas_groups), function(fam_name) {
+      # Get the column names in S3 for this family
+      cols <- paste0(pfas_groups[[fam_name]], "_Results")
+      cols_existing <- intersect(cols, names(S3))  # only existing columns
+      
+      tibble(
+        !!fam_name := rowSums(S3[cols_existing], na.rm = TRUE)
+      )
+    })
+  )
+
+S3 <- S3 %>%
+  mutate(OBSPRED_ID = row_number())
+
+# use this geospatially snapped point file to join to the PFAS data
+obs_nhdhr <- st_read(dsn = "../data/shp/obs_sites.shp")
+
+# Join geospatial data with the PFAS data
+S3_Cat <-  left_join(obs_nhdhr, S3, by = c("site_id"="Name")) |>
+  left_join(covariate_data, by = "reach_id")
+
+S3_sf <- st_transform(S3_Cat, st_crs(flines)) |>
+  mutate(ssnid = row_number()) 
+
+obs <- st_transform(S3_sf, crs =5070) |> st_zm() 
+```
+
+
+## Predictions sites  
+
+These are placed at the center of each flowline, but will be represented by data sets aggregated/summarized for the downstream pour point of the reach/flowline. Since the NHDPlus high-resolution network has relatively short reach segments (mean length of ##m) this shouldn't be problematic or poorly representative of the reach.  
+
+```{r}
+pred <- flines |> 
+  st_zm() |>                  # drop Z and M dimensions if they exist
+  st_centroid() |>            # centroid works for LINESTRING
+  st_cast("POINT") |>         # ensures geometry is POINT
+  mutate(ssnid = reach_id + 10000) |>
+  select(ssnid, reach_id, NHDPlusIDt, 
+         ends_with(c("_km2","_bas","_rca")),
+         lengthkm, areasqkm, totdasqkm, geometry) |>
+  st_transform(pred_sites, crs =5070) |> st_zm() 
+```
+
+
+#  3.  Build the SSN object  
+
+Directory to hold the files during SSN object development.  
+
+```{r}
+ssnobj_devdir <- "../ssnobj_dev/"
+```
+
+##  3.1. Develop the Landscape network (LSN) 
+
+```{r}
+flowlines_2 <- lines_to_lsn(streams = flowline, 
+                           lsn_path = ssnobj_devdir,
+                           check_topology = TRUE,
+                           snap_tolerance = 0,
+                           topo_tolerance = 0,
+                           remove_ZM = TRUE,
+                           overwrite = TRUE)
+```
+
+##  3.2. Incorporate sites  
+
+###  3.2.1. Observation sites  
+
+```{r}
+obs <- sites_to_lsn(sites = obs,
+                    edges = flowlines_2,
+                    lsn_path = ssnobj_devdir,
+                    file_name = "obs",
+                    snap_tolerance = 5,
+                    save_local = TRUE,
+                    overwrite = TRUE)
+```
+
+###  3.2.1. Prediction sites  
+
+```{r}
+preds <- sites_to_lsn(sites = pred,
+                      edges = flowlines_2,
+                      lsn_path = ssnobj_devdir,
+                      file_name = "preds",
+                      snap_tolerance = 250,
+                      save_local = TRUE,
+                      overwrite = TRUE)
+```
+
+##  3.3.  Calculate upstream distances for edges and sites  
+
+```{r}
+edges <- updist_edges(edges = flowlines_2,
+                      save_local = TRUE,
+                      lsn_path = ssnobj_devdir,
+                      calc_length = TRUE)
+```
+
+
+```{r}
+site.list <- updist_sites(sites = list(obs = obs, 
+                                       preds = preds),
+                          edges = edges,
+                          length_col = "Length",
+                          save_local = TRUE,
+                          lsn_path = ssnobj_devdir)
+```
+
+
+##  3.4. Calculate additive function values  
+
+
+```{r}
+edges <- afv_edges(edges = edges,
+                   infl_col = "basin_area_km2",
+                   segpi_col = "areaPI",
+                   afv_col = "afvArea",
+                   lsn_path = ssnobj_devdir)
+
+site.list <- afv_sites(sites = site.list,
+                       edges = edges,
+                       afv_col = "afvArea",
+                       save_local = TRUE,
+                       lsn_path = ssnobj_devdir)
+```
+
+
+#  4. Assemble the pieces into an SSN object  
+
+```{r}
+PFAS_ssn <- ssn_assemble(edges = edges,
+                         lsn_path = ssnobj_devdir,
+                         obs_sites = site.list$obs,
+                         preds_list = site.list[c("preds")],
+                         ssn_path = "../ssnobj/PFAS_NHDHR.ssn",
+                         import = FALSE,
+                         check = TRUE, 
+                         afv_col = "afvArea",
+                         overwrite = TRUE,
+                         verbose = TRUE)
+```
+
+
+
+

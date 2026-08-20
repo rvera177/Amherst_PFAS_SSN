@@ -1,0 +1,422 @@
+---
+title: "Mill River PFAS: Hydrography development"
+author: "Matt Fuller"
+date: "2026-05-07"
+output: html_document
+---
+
+This script takes a modified DEM that has the NHDPlusHR river networks burned in with the additional stream segments connecting the Campus Pond and Tan Brook to the mainstem Mill River. Ultimately, this network will  create the hydrography for the SSN model, but we will use the conditioned DEM to establish updated catchments and reach contributing areas that allow us to extract area-weighted covariates for each stream reach in the study network. Script takes aproximately 1 hour to run all the code.  
+
+```{r}
+library(whitebox); wbt_init()
+#install_whitebox() # install the whitebox tools if not already installed
+library(sf)
+library(terra)
+library(tidyverse)
+library(gdalUtilities)
+library(igraph)
+library(exactextractr)
+library(future.apply)
+library(lwgeom)
+```
+
+Update metadata with no data tag that whitebox tools recognizes.  
+
+```{r}
+gdal_translate(
+  src_dataset = "../data/dem/MillRiver_elev_cm_TinyNoDataValue.tif",
+  dst_dataset = "../data/dem/elev_cm_01clean.tif",
+  a_nodata = -9999,
+  of = "GTiff"
+)
+
+
+gdalwarp(
+  srcfile = "../data/dem/elev_cm_01clean.tif",
+  dstfile = "../data/dem/elev_cm_02clean.tif",
+  t_srs = "EPSG:5070"
+)
+
+wbt_set_nodata_value(input = "../data/dem/elev_cm_02clean.tif",
+                     output = "../data/dem/elev_cm_03clean.tif", 
+                     back_value = -21474836 )
+
+plot(rast("../data/dem/elev_cm_03clean.tif"))
+summary(rast("../data/dem/elev_cm_03clean.tif"))
+```
+
+
+DEM conditioning and preparation for hydrologic analysis and watershed delineation. This includes burning in the stream network, filling depressions, calculating flow direction and flow accumulation, and snapping pour points to the flow network.  The resulting flow direction raster and snapped pour points will be used for watershed delineation in the next steps.
+
+
+```{r}
+# -----------------------------------------------------------
+# INPUT paths 
+# -----------------------------------------------------------
+dem_path <- "../data/dem/elev_cm_03clean.tif" 
+# edited NHDPlus HR w/ tributary added to connect w/ Campus Pond and Tan Brook
+# also reestablished topologic connectivity using a trace network in ArcGIS Pro
+streams_path <- "../data/shp/MillRiver_NHDPlusHR_EPSG5070_trace.shp" 
+
+output_dir <- "../outputs"
+
+# -----------------------------------------------------------
+# LOAD DATA
+# -----------------------------------------------------------
+dem <- rast(dem_path)
+writeRaster(dem, file.path("../data/dem/dem01_m.tif"), overwrite=TRUE)
+# plot(dem)
+# summary(dem)
+
+streams <- st_read(streams_path) |> 
+  st_transform(crs(dem)) #  ensure streams are in same CRS as DEM
+```
+
+
+```{r}
+# -----------------------------------------------------------
+# STEP 1: CREATE STREAM RASTER FOR BURNING
+# -----------------------------------------------------------
+# read in Rasterized streams and flatwaters conditioned in ArcGIS Pro
+streams_r <- rast("../data/raster/nhdhr_swnet_streams_clip.tif") |>  
+  project(crs(dem)) |> crop(ext(dem)) |> classify(cbind(NA, 0))
+flatwater_r <- rast("../data/raster/nhdhr_swnet_flatwater_clip.tif") |>  
+    project(crs(dem)) |> crop(ext(dem)) |> classify(cbind(NA, 0))
+plot(streams_r)
+plot(flatwater_r)
+```
+
+
+```{r}
+# -----------------------------------------------------------
+# STEP 2: BURN STREAMS INTO DEM
+# -----------------------------------------------------------
+# Burn depth (meters)
+burn_depth <- 5
+
+dem_burned <- dem - (streams_r * burn_depth) - (flatwater_r * (burn_depth/2))  # also burn flatwaters to ensure flow paths are open
+plot(dem_burned, main = "Burned DEM")
+
+writeRaster(x = dem_burned, filename = "../data/dem/dem02_burned.tif", overwrite=TRUE)
+
+dem_fill_burn <- wbt_fill_burn(
+  dem = "../data/dem/dem02_burned.tif", output = "../data/dem/dem03_filled_burn.tif",
+  streams = streams_path)
+```
+
+
+```{r}
+# -----------------------------------------------------------
+# STEP 3: HYDROLOGIC CORRECTION (Fill Depressions)
+# -----------------------------------------------------------
+wbt_fill_depressions(
+  dem = "../data/dem/dem03_filled_burn.tif", output = "../data/dem/dem04_filled.tif")
+```
+
+
+```{r}
+dem_filled <- rast("../data/dem/dem04_filled.tif")
+plot(dem_filled, main = "Filled, Burned-DEM")
+```
+
+
+```{r}
+# -----------------------------------------------------------
+# STEP 4: FLOW DIRECTION & FLOW ACCUMULATION
+# -----------------------------------------------------------
+wbt_d8_pointer(
+  dem = "../data/dem/dem04_filled.tif", output = "../data/raster/flow_dir.tif")
+
+wbt_d8_flow_accumulation(
+  input = "../data/dem/dem04_filled.tif", output = "../data/raster/flow_acc.tif",
+  out_type = "cells")
+```
+
+```{r}
+fdir <- rast("../data/raster/flow_dir.tif")
+fa <- rast("../data/raster/flow_acc.tif")
+plot(fa, main = "Flow Accumulation (cells)")
+```
+
+
+
+Next we take the stream raster from NHDHR that has a value of 1 (the stream raster) and convert it to points and assign the reach_id value to it based on a spatial join of those raster cells to the stream flowlines. Then we convert these points back to a raster using the reach_id as a value. This gives us a raster with cells that represent the reach_id from the hydrography.  
+
+```{r}
+# read in the NHDPlus HR stream raster filtered to just the value=1 cells
+streams_rast_is_1 <- rast("../data/raster/nhdhr_swnet_streams_clip.tif") |>  
+  project(crs(dem)) |> crop(ext(dem)) 
+
+# set the stream raster to points where the stream raster value=1
+pts <- as.points(streams_rast_is_1 == 1) |> st_as_sf() |> st_zm(drop = TRUE)
+
+# grab the nearest reach_id value for each point from the streams layer and
+# assign it to the point layer
+nearest <- st_nearest_feature(st_zm(pts, drop = TRUE, what = "ZM"), 
+                              st_zm(streams, drop = TRUE, what = "ZM"))
+pts$reach_id <- streams$reach_id[nearest]
+
+# convert back to raster with each reach_id value as the raster cell value
+reach_id_raster <- rasterize(vect(pts), streams_rast_is_1, field="reach_id")
+writeRaster(x = reach_id_raster, overwrite = TRUE, 
+            filename = "../data/raster/streams_reachid_raster.tif")
+```
+
+Now we have a raster that has the reach_id value associated for each cell of the stream raster.  
+
+<br>  
+
+Next we mask the flow accumulation raster so that we can search through the stream raster cells and identify the largest flow accumulation cell within each reach_id segment.  This will be the cell that we snap the pour point to for watershed delineation.  
+
+```{r}
+fa_stream_only <- mask(fa, reach_id_raster)
+```
+
+Now we convert the flow accumulation raster to points.  
+
+```{r}
+fa_pts <- as.points(fa_stream_only) |> st_as_sf()
+names(fa_pts)[names(fa_pts)=="flowacc"] <- "fa_value"
+```
+
+
+Now we have two point layers in the fa_pts and the pts (that represent the reach_id values). We can use a spatial join to bring the flow accumulation values into the pts layer, which will allow us to identify the cell with the maximum flow accumulation for each reach_id segment. This is the cell that we will snap our pour points to for watershed delineation.  
+
+```{r}
+join_pts <- st_join(pts, fa_pts, join = st_is_within_distance, dist = 5)
+```
+
+
+For each reach_id value, we can now retain the largest flow accumulation value and the corresponding point geometry. These will be the points that we use as our pour points to for watershed delineation.  
+
+```{r}
+pour_points <- join_pts %>%
+  group_by(reach_id) %>%
+  filter(flow_acc == max(flow_acc, na.rm = TRUE)) %>%
+  ungroup()
+```
+
+One reach is missing from the pour_points file. Let's find it.  
+
+```{r}
+streams$reach_id[!(streams$reach_id %in% pour_points$reach_id)]
+```
+This is a VERY short segment that gets pushed out by other reaches. Add end point for reach_id = 223 flowline and it will land correctly within the flow accumulation raster for delineation.  
+
+reach_id = 223, flow_acc = 96327  
+
+Let's add 223 to the pour points and then we'll be ready for watershed delineation.   
+
+```{r}
+pt_223_sf <- streams[!(streams$reach_id %in% pour_points$reach_id),"reach_id"] |>
+  st_endpoint() |> 
+  st_cast("POINT") |>
+  st_as_sf() |> 
+  st_zm(drop = TRUE) |>
+  mutate(Band_1 = 1,
+         reach_id = 223,
+         flow_acc = 96327) |> 
+  rename(geometry = x)
+
+final_pour_points <- rbind(pour_points, pt_223_sf)
+
+write_sf(final_pour_points, file.path("../data/shp/final_pour_points.shp"), delete_dsn=TRUE)
+```
+
+
+From here I went to ArcGIS Pro and manually adjusted pour points to the correct cells at each tributary junction because despite this above attempt to snap the pour points to the cell with the maximum flow accumulation within each reach_id2 segment, some of the pour points were still landing in the wrong place due to how the flow accumulation raster is structured and how the snapping process worked. By manually adjusting the pour points in ArcGIS Pro, I was able to ensure that they are correctly aligned with the flow network vectors and flow accumulation raster and will produce accurate watershed delineations when we run the Whitebox tools below.  
+
+Read in the manually corrected pour points.  
+
+```{r}
+final_pour_points <- 
+  st_read("../data/shp/final_pour_points_manual_corrections_20260518.shp") |> 
+  st_transform(crs(dem))
+
+pp_ras <- setValues(fdir, 0)
+
+for (i in 1:nrow(final_pour_points)) {
+  pt <- final_pour_points[i, ]
+  reach_id <- pt$reach_id
+  coords <- st_coordinates(pt)
+  cell_idx <- terra::cellFromXY(fdir, coords)
+  pp_ras[cell_idx] <- reach_id
+}
+
+writeRaster(pp_ras, "../data/raster/final_pour_points_rasterized.tif", overwrite = TRUE)
+
+```
+
+
+This code chunk is a serial processing approach rather than parallel. This takes 30-40 minutes for all 479 watersheds to be delineated. Parallelization of this using future_lapply() was problematic (errors reading and writing from the same flow direction raster) and whitebox tools start-up was conflicting on multiple workers. The start up time cost was too much for a foreach loop to be more efficient than a serial loop too. So serial loop it is!  
+
+```{r message=FALSE}
+# STEP 6: DELINEATE WATERSHEDS
+# Basin & RCA are not the same! this is only basin scale
+dir.create("../outputs/basins/", showWarnings = FALSE)
+dir.create("../outputs/basins_pourpoints/", showWarnings = FALSE)
+
+for (i in seq_len(nrow(final_pour_points))) {
+pt <- final_pour_points[i, ]
+id <- sprintf("%03d", pt$reach_id)
+write_sf(pt, file.path("../outputs/basins_pourpoints/", paste0("pour_point_", id, ".shp")))
+
+# Suppress Whitebox output
+capture.output(
+ wbt_watershed(
+ d8_pntr = file.path("../data/raster/flow_dir.tif"),
+ pour_pts = file.path("../outputs/basins_pourpoints/", paste0("pour_point_", id, ".shp")),
+ output = file.path("../outputs/basins/", paste0("basin_", id, ".tif")),
+ verbose_mode = FALSE)
+)
+if (i %% 10 == 0) cat("Completed", i, "/", nrow(final_pour_points), "\n")
+}
+```
+
+We can read back in all the individual watershed rasters as a list and also read back in the raster stack.
+
+```{r}
+# -----------------------------------------------------------
+# STEP 6b : Create Reach Start Points (Upstream Ends)
+# -----------------------------------------------------------
+# Run multi-point watershed using corrected pour points raster
+# (final_pour_points_rasterized.tif was created with setValues loop above,
+# ensuring actual reach_ids are preserved in the raster cell values)
+reach_catchments <- wbt_watershed(
+  d8_pntr = "../data/raster/flow_dir.tif",
+  pour_pts = "../data/raster/final_pour_points_rasterized.tif",
+  output = "../data/raster/reach_rca_multipoint.tif")
+
+# -----------------------------------------------------------
+# Reclassify sequential zones back to actual reach_ids
+# Whitebox always reassigns sequential labels (1, 2, 3...) 
+# regardless of input raster values - reclassification is required
+# -----------------------------------------------------------
+rca_seq <- rast("../data/raster/reach_rca_multipoint.tif")
+
+# Extract sequential zone value at each pour point location
+extracted <- terra::extract(rca_seq, vect(final_pour_points))
+
+# Build zone -> reach_id lookup table
+zone_lookup <- data.frame(
+  seq_zone = extracted$reach_rca_multipoint,
+  reach_id = final_pour_points$reach_id
+) |> filter(!is.na(seq_zone))
+
+# Apply reclassification: sequential zones -> actual reach_ids
+reclass_mat <- as.matrix(zone_lookup[, c("seq_zone", "reach_id")])
+rca_final <- classify(rca_seq, reclass_mat)
+
+# Verify - should now show actual reach_ids (474, 475, 24, 390...)
+# NOT sequential 1-479
+unique(rca_final)
+
+writeRaster(rca_final, "../data/raster/reach_rca_multipoint.tif", overwrite = TRUE)
+
+# -----------------------------------------------------------
+# Stack RCA Raster
+# -----------------------------------------------------------
+reach_rca_stack <- rast("../data/raster/reach_rca_multipoint.tif")
+saveRDS(reach_rca_stack, file = "../data/raster/reach_rca_rasterstack.rds")
+reach_rca_stack <- readRDS("../data/raster/reach_rca_rasterstack.rds")
+plot(reach_rca_stack)
+```
+
+```{r}
+reach_basins <-
+  list.files(path = "../outputs/basins/", pattern = "basin_", full.names = TRUE) |>
+  (\(x) x[basename(x) != "basin_.tif"])() |>   # Exclude artificial basin
+  lapply(terra::rast)
+
+basin_stack <- rast(reach_basins)
+saveRDS(basin_stack, file = "../data/raster/reach_basins_rasterstack.rds")
+basin_stack <- readRDS("../data/raster/reach_basins_rasterstack.rds")
+plot(basin_stack)
+```
+
+```{r}
+# -----------------------------------------------------------
+# Create Mapping from Filenames (excluding basin_.tif)
+# -----------------------------------------------------------
+basin_files <- list.files("../outputs/basins/", pattern = "basin_", full.names = TRUE)
+rca_files <- list.files("../outputs/rca_individual/", pattern = "rca_zone_", full.names = TRUE)
+
+# Exclude the problematic basin_.tif
+basin_files <- basin_files[basename(basin_files) != "basin_.tif"]
+
+mapping <- data.frame(
+  basin_filename = basename(basin_files),
+  rca_filename = NA,
+  reach_id = NA
+)
+
+# For each basin, find corresponding RCA with matching reach_id
+for (i in 1:nrow(mapping)) {
+  # Extract reach_id from basin filename (e.g., "basin_223.tif" → 223)
+  basin_id <- as.numeric(gsub("basin_|.tif", "", mapping$basin_filename[i]))
+  
+  # Find RCA with same reach_id
+  rca_match <- paste0("rca_zone_", sprintf("%03d", basin_id), ".tif")
+  
+  if (rca_match %in% basename(rca_files)) {
+    mapping$rca_filename[i] <- rca_match
+    mapping$reach_id[i] <- basin_id
+  }
+}
+
+write.csv(mapping, "../data/basin_reach_mapping.csv", row.names = FALSE)
+head(mapping)
+
+# Verify we have 479 unique reaches
+cat("Total reaches delineated:", nrow(mapping), "\n")
+cat("Unique reach_ids:", length(unique(mapping$reach_id)), "\n")
+```
+Can also run delineation from multi-point pourpoint shapefile, which is much faster but can produce slightly different results due to how Whitebox handles multiple pour points in one run.  Compare outputs from single vs multi-point runs to ensure consistency.  
+
+```{r}
+# Function to plot 5 reaches with basin (blue) and RCA (red) overlay
+plot_basin_rca_multi <- function(reach_ids, basin_stack, reach_rca_stack, mapping) {
+  
+  par(mfrow = c(2, 5), mar = c(2, 2, 2, 2))
+  
+  for (reach_id in reach_ids) {
+    basin_layer <- which(mapping$reach_id == reach_id)[1]
+    
+    if (is.na(basin_layer)) {
+      cat("reach_id", reach_id, "not found\n")
+      next
+    }
+    
+    # Get basin raster for this reach
+    basin_rast <- basin_stack[[basin_layer]]
+    
+    # Extract ONLY this reach's RCA zone (non-matching cells = NA)
+    rca_binary <- ifel(reach_rca_stack == reach_id, 1, NA)
+    
+    # Plot basin in blue, RCA in red overlay
+    plot(basin_rast, col = "lightblue", main = paste("reach_id", reach_id), legend = FALSE)
+    plot(rca_binary, col = "red", add = TRUE, legend = FALSE)
+  }
+  
+  par(mfrow = c(1, 1))
+}
+
+plot_basin_rca_multi(c(1:20), 
+                     basin_stack, reach_rca_stack, mapping)
+```
+
+If you wanted to, you could convert each reach watershed delineation into a polygon and save.  This is not necessary for the next steps, but it can be useful for visualization.   
+
+```{r}
+# Save polygon versions
+# reach_polys <- lapply(seq_along(reach_basins), function(i) {
+#   p <- as.polygons(reach_basins[[i]])
+#   p$reach_id2 <- i
+#   p
+# })
+# 
+# reach_polys <- do.call(rbind, reach_polys)
+# st_write(reach_polys, file.path(output_dir, "reach_catchments.gpkg"), delete_dsn=TRUE)
+```
+
+
