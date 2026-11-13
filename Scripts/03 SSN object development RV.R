@@ -98,6 +98,9 @@ prepare_event <- function(df) {
       across(all_of(intersect(pfas_result_cols, names(df)))),
       na.rm = TRUE)
     ) |>
+    mutate(HI = as.vector(
+      as.matrix(df[paste0(names(hi), "_Results")]) %*% (1/hi))
+    ) |>
     # Strip _Results suffix from compound columns
     rename_with(~ gsub("_Results$", "", .x)) |>
     # Add log1p transformed columns for all numeric PFAS columns
@@ -106,7 +109,9 @@ prepare_event <- function(df) {
         .cols = all_of(
           gsub("_Results$", "",
                c(pfas_result_cols,
-                 paste0(names(pfas_groups), "_Results")))
+                 paste0(names(pfas_groups),
+                 "_Results"),
+                 "HI"))
         ),
         .fns  = list(log1p = ~ log1p(.x)),
         .names = "log1p_{.col}"

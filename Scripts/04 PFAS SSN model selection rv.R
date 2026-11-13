@@ -35,10 +35,9 @@ panderOptions('digits',8)
 remove_outliers <- FALSE
 
 # ---- Analysis settings ----
-# A compound is only modeled for a sampling event if it has at least this many sites with a
-# non-zero (above-MDL) result. S1 has 17 sites, S4 has 20, S3 has 33, so 10 drops compounds
-# detected at fewer than ~50-60% of the sites in S1/S4.
-min_nonzero <- 10
+# A compound is only modeled for a sampling event if it was detected as non-zero (above-MDL) result
+# at least in 2/3 of the sites. S1 has 17 sites, S4 has 20, S3 has 33
+min_detect_fraction <- 2/3 #~66% detection rate per sampling event
 
 # Estimation method for the final retained models (section 5.4). Model SELECTION always uses
 # "ml" (required to compare different fixed effects with AIC). "reml" gives less biased variance
@@ -207,7 +206,7 @@ ssn_obj_list <- ssn_list |>
     # Drops compounds before model fitting where ssn_lm will always fail:
     #    All values zero or constant (SD = 0)
     #    Fewer than 3 non-NA observations
-    #    Fewer than min_nonzero non-zero (above-MDL) values (set at the top of this script)
+    #    Fewer than min_detect_fraction ,which is detection at atleast 2/3 of sites per sampling event
     # Checked on RAW scale — log1p version dropped automatically if raw fails
     
     all_response_vars <- c(
@@ -223,7 +222,8 @@ ssn_obj_list <- ssn_list |>
           n_non_na  <- sum(!is.na(x))
           n_nonzero <- sum(x > 0,  na.rm = TRUE)
           sd_val    <- sd(x,       na.rm = TRUE)
-          n_non_na < 3 | n_nonzero < min_nonzero | is.na(sd_val) | sd_val == 0
+          n_non_na < 3 | n_nonzero / n_non_na < min_detect_fraction - 1e-9| is.na(sd_val) | sd_val == 0
+          #filter our samples detected less at less than 2/3 of sites
         }
       )) |>
       tidyr::pivot_longer(

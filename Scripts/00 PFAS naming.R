@@ -40,15 +40,19 @@ pfas_groups <- list(
   FTCA         = c("X3.3_FTCA", "X5.3_FTCA", "X7.3_FTCA"))
 
 pfas_individual <- unlist(pfas_groups, use.names = FALSE)   # the 40 measured compounds
-pfas_compounds  <- c("PFAS40", pfas_individual, names(pfas_groups))  # every response variable
+hi <- c(PFHxS = 10, PFNA = 10, HFPO.DA = 10, PFBS = 2000)
+pfas_compounds  <- c("PFAS40", "HI", pfas_individual, names(pfas_groups))  # every response variable
+
+
 
 # Family lookup used to colour/group plots in script 05 (built from pfas_groups
 # so plots always agree with the group sums that were modeled)
 pfas_family_lookup <- dplyr::bind_rows(
-  tibble::tibble(compound = c("PFAS40", names(pfas_groups)),
+  tibble::tibble(compound = c("PFAS40", "HI", names(pfas_groups)),
                  family   = "Summary total"),
   tibble::tibble(family   = rep(names(pfas_groups), lengths(pfas_groups)),
                  compound = pfas_individual))
 
 stopifnot(length(pfas_individual) == 40, !anyDuplicated(pfas_compounds))
+stopifnot((all(names(hi) %in% pfas_individual)))
 
